@@ -1,11 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { InjectRepository } from '@nestjs/typeorm';
 import { Model } from 'mongoose';
-import { Chat, ChatDocument } from 'src/schemas/chat.schema';
-import { Message, MessageDocument } from 'src/schemas/message.schema';
-import { User } from 'src/users/entities/user.entity';
-import { In, Repository } from 'typeorm';
+import { Chat, ChatDocument } from 'src/chats/chat.schema';
+import { ChatsService } from 'src/chats/chats.service';
+import { Message, MessageDocument } from 'src/messages/message.schema';
+import { FileService } from 'src/services/file';
+import { UsersService } from 'src/users/users.service';
 import { CreateMessageDto } from './dto/create-message.dto';
 import { UpdateMessageDto } from './dto/update-message.dto';
 
@@ -14,11 +14,13 @@ export class MessagesService {
   constructor(
     @InjectModel(Message.name) private MessageModel: Model<MessageDocument>,
     @InjectModel(Chat.name) private ChatModel: Model<ChatDocument>,
-    @InjectRepository(User) private readonly usersRepository: Repository<User>,
+    private readonly chatsService: ChatsService,
+    private readonly usersService: UsersService,
+    private readonly fileService: FileService
   ) {}
 
   async findAllUnread(socketId: string) {
-    const user = await this.usersRepository.findOne({ where: { socket_id: socketId }});
+    const user = await this.usersService.findOneBySocketId(socketId);
     const chats = await this.ChatModel.find({ userIds: user?.id }).populate({
       path: 'messages',
       match: { isRead: false, sender: { $ne: user?.id } },
@@ -38,7 +40,6 @@ export class MessagesService {
     return unreadMessages;
   }
 
-
   async findByChatId(chatId: string) {
     const chat = await this.ChatModel.findById(chatId).populate({
       path: 'messages',
@@ -52,22 +53,17 @@ export class MessagesService {
     if (!chat) return null;
   
     const userIds = new Set(chat.messages.map((message) => message.sender));
-  
-    const users = await this.usersRepository.findBy({ id: In([...userIds]) });
+    const users = await this.usersService.findUsersByIds(Array.from(userIds));
   
     const messages = chat.messages.map((message) => {
       const user = users.find((user) => user.id === message.sender);
       if (!user) return null;
   
-      const replyTo = message.replyTo
-        ? {
-            id: (message.replyTo as any)._id.toString(),
-            preview: message.replyTo.text || (message.replyTo.attachments[0]?.name || ''),
-          }
-        : null;
+      const replyTo = createReplyTo(message);
   
       return {
         id: (message as any)._id!.toString(),
+        isRead: message.isRead,
         text: message.text,
         attachments: message.attachments,
         timestamp: message.timestamp,
@@ -83,67 +79,83 @@ export class MessagesService {
     return messages.filter(Boolean);
   }
   
-  async create(createMessageDto: CreateMessageDto, server: any) {
-    const { text, senderId, chatId, replyToMessageId } = createMessageDto;
+  async create(createMessageDto: CreateMessageDto) {
+    const { text, senderId, chatId, replyToMessageId, attachments } = createMessageDto;
+
+    const file = attachments && attachments[0];
+    if (file) await this.fileService.saveFile(file.data, "./files/" + file.name)
 
     const message = new this.MessageModel({
       text,
       sender: senderId,
+      attachments: file ? [{path: "files/" + file.name, fileType: file.fileType, name: file.name}] : [],
       replyTo: replyToMessageId, 
       timestamp: new Date(),
     });
 
-    const savedMessage = await (await message.save()).populate('replyTo');
+    const savedMessage = await message.save().then(m => m.populate('replyTo'));
+    const chat = await this.chatsService.saveMessage(chatId, savedMessage._id);
+    const sender = await this.usersService.findOne(senderId); 
+    const replyTo = createReplyTo(savedMessage);
 
-    const chat = await this.ChatModel.findByIdAndUpdate(
-      chatId,
-      { $push: { messages: savedMessage._id } },
-      { new: true }
-    );
-    
     if (!chat) throw new Error('Invalid chat id in received message');
+    if (!sender) throw new Error('Sender does not exist');
+    
+    const dataToBroadcast = {
+      message: {
+        id: (message as any)._id.toString(),
+        text: message.text,
+        attachments: message.attachments,
+        timestamp: message.timestamp,
+        replyTo,
+        sender: {
+          id: sender.id,
+          name: sender.name,
+          avatar: sender?.avatar,
+        },
+      }, 
+      chatId
+    };
 
-    const users = await this.usersRepository.findBy({ id: In(chat.userIds) });
-    const sender = users.find((user) => user.id === senderId);
-    if (!sender) throw new Error('Sender is not a member of the chat');
-    users.forEach(async (user) => {
-      const socketId = user.socket_id;
-        const targetClient = server.sockets.sockets.get(socketId);
+    return { chat, dataToBroadcast, senderId } as const;
+  }
 
-      if (targetClient && user.id !== senderId ) {
-        const replyTo = message.replyTo
-        ? {
-            id: (message.replyTo as any)._id.toString(),
-            preview: message.replyTo.text || (message.replyTo.attachments[0]?.name || ''),
-          }
-        : null;
-        targetClient.emit('message', {message: {
-          id: (message as any)._id!.toString(),
-          text: message.text,
-          attachments: message.attachments,
-          timestamp: message.timestamp,
-          replyTo,
-          sender: {
-            id: sender.id,
-            name: sender.name,
-            avatar: sender?.avatar,
-          },
-        }, chatId});
-      }
-    });
+  async update(updateMessageDto: UpdateMessageDto) {
+    const message = await this.MessageModel.findById(updateMessageDto.id);
+    if (!message) throw new Error('Message does not exist');
+    message.text = updateMessageDto.text;
+    message.save();
+    const chat = await this.ChatModel.findById(updateMessageDto.chatId);
+    if (!chat) throw new Error('Invalid chat id in received message');
+    return { message, senderId: message.sender, chat } as const;
+  }
 
-    return savedMessage;
+  async remove(id: string, chatId: string) {
+    const message = await this.MessageModel.findById(id);
+    const senderId = message?.sender;
+    const chat = await this.ChatModel.findByIdAndUpdate(
+      { _id: chatId },
+      { $pull: { messages: id } }
+    );
+
+    if (!chat) throw new Error('Invalid chat id in received message');
+    if (!senderId) throw new Error('Sender does not exist');
+
+    const msg = await this.MessageModel.findByIdAndDelete(id);
+    return { chat, senderId, msg } as const;
   }
 
   findOne(id: number) {
     return `This action returns a #${id} message`;
   }
+}
 
-  update(id: number, updateMessageDto: UpdateMessageDto) {
-    return `This action updates a #${id} message`;
-  }
 
-  remove(id: number) {
-    return `This action removes a #${id} message`;
-  }
+function createReplyTo(message: Message) {
+  return message.replyTo
+    ? {
+        id: (message.replyTo as any)._id.toString(),
+        preview: message.replyTo.text || (message.replyTo.attachments[0]?.name || ''),
+      }
+    : null;
 }

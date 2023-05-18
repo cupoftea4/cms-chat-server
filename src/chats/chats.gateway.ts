@@ -1,4 +1,4 @@
-import { WebSocketGateway, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayInit } from '@nestjs/websockets';
+import { WebSocketGateway, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayInit, WebSocketServer } from '@nestjs/websockets';
 import { ChatsService } from './chats.service';
 import { CreateChatDto } from './dto/create-chat.dto';
 import { UpdateChatDto } from './dto/update-chat.dto';
@@ -11,6 +11,8 @@ export class ChatsGateway implements OnGatewayInit {
     private readonly chatsService: ChatsService,
     private readonly usersService: UsersService
   ) {}
+  @WebSocketServer()
+  server: Server;
 
   async afterInit(server: Server) {
     server.on('connection', async (socket: Socket) => {
@@ -23,8 +25,6 @@ export class ChatsGateway implements OnGatewayInit {
       }
       console.log("Connected successfully")
       socket.emit('connected', socket.id);
-      server.emit('connected', socket.id);
-      console.log('user ' + token + ' connected by ' + socket.id);
     });
 
     server.on('disconnect', (socket: Socket) => {
@@ -39,15 +39,31 @@ export class ChatsGateway implements OnGatewayInit {
     return await this.chatsService.create(createChatDto);
   }
 
+  @SubscribeMessage('joinChat')
+  async join(@MessageBody() chatId: string, @ConnectedSocket() client: Socket) {
+    return await this.chatsService.join(chatId, client.id);
+  }
+
+  @SubscribeMessage('readChat')
+  async read(@MessageBody() chatId: string, @ConnectedSocket() client: Socket) {
+    return await this.chatsService.read(chatId, client.id, this.server);
+  }
+
   @SubscribeMessage('getAllChats')
   findAll(@ConnectedSocket() client: Socket) {
     console.log('getAllChats');
     return this.chatsService.findAllByUser(client.id);
   }
 
-  @SubscribeMessage('findOneChat')
-  findOne(@MessageBody() id: number) {
-    return this.chatsService.findOne(id);
+  @SubscribeMessage('getAllChatMembers')
+  findAllMembers(@MessageBody() chatId: string) {
+    console.log('getAllChatsMembers');
+    return this.chatsService.findAllMembers(chatId);
+  }
+
+  @SubscribeMessage('findChatsByName')
+  findByName(@MessageBody() name: string) {
+    return this.chatsService.findByName(name);
   }
 
   @SubscribeMessage('updateChat')

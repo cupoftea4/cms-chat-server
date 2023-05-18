@@ -9,11 +9,10 @@ export class Message {
   @Prop()
   text: string;
 
-  @Prop({ type: [{ id: String, url: String, type: String, name: String}], default: [] })
+  @Prop({ type: [{ path: String, fileType: String, name: String}], default: [] })
   attachments: {
-    id: string;
-    url?: string;
-    type: string;
+    path: string;
+    fileType: string;
     name: string;
   }[];
 
@@ -21,7 +20,7 @@ export class Message {
   sender: number; // user id in mysql users table
 
   @Prop() 
-  author: number; // maybe
+  author: number;
 
   @Prop({ default: false}) 
   isRead: boolean;
